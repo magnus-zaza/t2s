@@ -437,31 +437,15 @@
 
   /* ---------------- recording to a file ---------------- */
   /* The speech API gives no access to its own audio, so the only way to
-     capture it is to record what the tab is playing. */
+     capture it is to record what the tab plays. MediaRecorder is no use
+     here: it writes fragmented MP4 or WebM, neither of which WhatsApp and
+     Android reliably play. So take the raw samples and encode MP3. */
   var recBtn=$("record"), recRow=$("recRow");
-  var rec={on:false, closing:false, mr:null, chunks:[], stream:null,
-           ctx:null, an:null, peak:0, timer:null, mime:"", ext:"webm"};
-  var dl;
+  var rec={on:false, closing:false, stream:null, ctx:null, node:null,
+           src:null, mute:null, buf:[], len:0, peak:0, rate:48000};
 
-  if(!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia && window.MediaRecorder)){
+  if(!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia && window.AudioContext)){
     recRow.style.display="none";
-  }
-
-  function getDl(){
-    if(dl!==undefined) return Promise.resolve(dl);
-    if(window.claude && window.claude.use){
-      return window.claude.use("downloads")
-        .then(function(d){ dl=d||null; return dl; })
-        .catch(function(){ dl=null; return null; });
-    }
-    dl=null; return Promise.resolve(null);
-  }
-  getDl();
-
-  function pickMime(){
-    var c=["audio/mp4","audio/webm;codecs=opus","audio/webm"];
-    for(var i=0;i<c.length;i++){ if(MediaRecorder.isTypeSupported(c[i])) return c[i]; }
-    return "";
   }
 
   recBtn.addEventListener("click", function(){
@@ -482,63 +466,125 @@
 
   function begin(stream, tracks){
     rec.stream=stream;
-    rec.mime=pickMime();
-    rec.ext = rec.mime.indexOf("mp4")>-1 ? "mp4" : "webm";
     var only=new MediaStream(tracks);
-    rec.peak=0;
-    try{
-      rec.ctx=new (window.AudioContext||window.webkitAudioContext)();
-      var srcNode=rec.ctx.createMediaStreamSource(only);
-      rec.an=rec.ctx.createAnalyser(); rec.an.fftSize=1024;
-      srcNode.connect(rec.an);
-      var probe=new Uint8Array(rec.an.fftSize);
-      rec.timer=setInterval(function(){
-        rec.an.getByteTimeDomainData(probe);
-        for(var i=0;i<probe.length;i++){
-          var d=Math.abs(probe[i]-128);
-          if(d>rec.peak) rec.peak=d;
-        }
-      },200);
-    }catch(e){}
-    rec.chunks=[];
-    try{
-      rec.mr = rec.mime ? new MediaRecorder(only,{mimeType:rec.mime}) : new MediaRecorder(only);
-    }catch(e){ rec.mr = new MediaRecorder(only); rec.ext="webm"; rec.mime=""; }
-    rec.mr.ondataavailable=function(e){ if(e.data && e.data.size) rec.chunks.push(e.data); };
-    rec.mr.onstop=finishRecording;
-    tracks[0].addEventListener("ended", function(){ if(rec.on && !rec.closing){ token++; synth.cancel(); finish(); } });
+    rec.ctx=new (window.AudioContext||window.webkitAudioContext)();
+    rec.rate=rec.ctx.sampleRate;
+    rec.src=rec.ctx.createMediaStreamSource(only);
+    rec.node=rec.ctx.createScriptProcessor(4096,2,2);
+    rec.mute=rec.ctx.createGain(); rec.mute.gain.value=0;
+    rec.buf=[]; rec.len=0; rec.peak=0;
+    rec.node.onaudioprocess=function(e){
+      if(!rec.on) return;
+      var ib=e.inputBuffer;
+      var L=ib.getChannelData(0);
+      var R=ib.numberOfChannels>1?ib.getChannelData(1):L;
+      var n=L.length, out=new Float32Array(n), m=0, i, v, a;
+      for(i=0;i<n;i++){
+        v=(L[i]+R[i])*0.5; out[i]=v;
+        a=v<0?-v:v; if(a>m) m=a;
+      }
+      if(m>rec.peak) rec.peak=m;
+      rec.buf.push(out); rec.len+=n;
+    };
+    rec.src.connect(rec.node);
+    rec.node.connect(rec.mute);
+    rec.mute.connect(rec.ctx.destination);
+    tracks[0].addEventListener("ended", function(){
+      if(rec.on && !rec.closing){ token++; synth.cancel(); finish(); }
+    });
     rec.on=true; rec.closing=false;
     recBtn.textContent="إيقاف التسجيل وحفظه";
     say("جارٍ التسجيل… اترك الصفحة مفتوحة حتى تنتهي القراءة، أو اضغط «إيقاف التسجيل وحفظه».");
-    rec.mr.start();
     setTimeout(function(){ start(); }, 700);
   }
 
   function closeRecording(){
     rec.closing=true;
-    setTimeout(function(){
-      try{
-        if(rec.mr && rec.mr.state!=="inactive") rec.mr.stop();
-        else finishRecording();
-      }catch(e){ finishRecording(); }
-    }, 900);
+    setTimeout(finishRecording, 900);
   }
 
   function finishRecording(){
     if(!rec.on) return;
     rec.on=false; rec.closing=false;
-    if(rec.timer){ clearInterval(rec.timer); rec.timer=null; }
+    var srcRate=rec.rate;
+    try{ rec.node.disconnect(); rec.src.disconnect(); rec.mute.disconnect(); }catch(e){}
     try{ if(rec.stream) rec.stream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){}
     try{ if(rec.ctx) rec.ctx.close(); }catch(e){}
     recBtn.textContent="سجّل ملفًا صوتيًا";
-    var blob=new Blob(rec.chunks,{type: rec.mime || "audio/webm"});
-    rec.chunks=[];
-    if(!blob.size){ say("لم يُسجَّل أي صوت. أعد المحاولة."); return; }
-    if(rec.peak<3){
+    if(!rec.len){ say("لم يُسجَّل أي صوت. أعد المحاولة."); return; }
+    if(rec.peak<0.005){
+      rec.buf=[]; rec.len=0;
       say("انتهى التسجيل لكنه يبدو صامتًا. أعد المحاولة واختر هذه المرة <b>الشاشة بالكامل</b> مع تفعيل <b>مشاركة صوت النظام</b>.");
       return;
     }
-    offer(blob);
+    var pcm=new Float32Array(rec.len), o=0;
+    rec.buf.forEach(function(b){ pcm.set(b,o); o+=b.length; });
+    rec.buf=[]; rec.len=0;
+    say("جارٍ تجهيز الملف الصوتي…");
+    setTimeout(function(){
+      var wave=resample(pcm, srcRate, 24000);
+      withLame(function(ok){
+        if(ok){
+          try{ deliver(toMp3(wave,24000), "mp3"); return; }catch(e){}
+        }
+        deliver(toWav(resample(wave,24000,16000),16000), "wav");
+      });
+    }, 60);
+  }
+
+  function resample(f32, from, to){
+    if(from===to) return f32;
+    var ratio=from/to, n=Math.floor(f32.length/ratio), out=new Float32Array(n), i, pos, i0, fr, i1;
+    for(i=0;i<n;i++){
+      pos=i*ratio; i0=pos|0; fr=pos-i0; i1=i0+1<f32.length?i0+1:f32.length-1;
+      out[i]=f32[i0]*(1-fr)+f32[i1]*fr;
+    }
+    return out;
+  }
+
+  function toInt16(f32){
+    var n=f32.length, out=new Int16Array(n), i, v;
+    for(i=0;i<n;i++){
+      v=f32[i]; if(v>1) v=1; if(v<-1) v=-1;
+      out[i]=v<0?v*0x8000:v*0x7FFF;
+    }
+    return out;
+  }
+
+  function withLame(cb){
+    if(window.lamejs && window.lamejs.Mp3Encoder) return cb(true);
+    var sc=document.createElement("script");
+    sc.src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js";
+    sc.onload=function(){ cb(!!(window.lamejs && window.lamejs.Mp3Encoder)); };
+    sc.onerror=function(){ cb(false); };
+    document.head.appendChild(sc);
+  }
+
+  function toMp3(f32, rate){
+    var enc=new window.lamejs.Mp3Encoder(1, rate, 64);
+    var pcm=toInt16(f32), parts=[], block=1152, i, chunk, buf;
+    for(i=0;i<pcm.length;i+=block){
+      chunk=pcm.subarray(i, i+block>pcm.length?pcm.length:i+block);
+      buf=enc.encodeBuffer(chunk);
+      if(buf.length) parts.push(new Uint8Array(buf));
+    }
+    buf=enc.flush();
+    if(buf.length) parts.push(new Uint8Array(buf));
+    if(!parts.length) throw new Error("empty");
+    return new Blob(parts, {type:"audio/mpeg"});
+  }
+
+  function toWav(f32, rate){
+    var pcm=toInt16(f32), n=pcm.length;
+    var ab=new ArrayBuffer(44+n*2), dv=new DataView(ab), i;
+    function tag(off,str){ for(var k=0;k<str.length;k++) dv.setUint8(off+k, str.charCodeAt(k)); }
+    tag(0,"RIFF"); dv.setUint32(4, 36+n*2, true); tag(8,"WAVE"); tag(12,"fmt ");
+    dv.setUint32(16,16,true); dv.setUint16(20,1,true); dv.setUint16(22,1,true);
+    dv.setUint32(24,rate,true); dv.setUint32(28,rate*2,true);
+    dv.setUint16(32,2,true); dv.setUint16(34,16,true);
+    tag(36,"data"); dv.setUint32(40,n*2,true);
+    for(i=0;i<n;i++) dv.setInt16(44+i*2, pcm[i], true);
+    return new Blob([ab], {type:"audio/wav"});
   }
 
   function stamp(){
@@ -546,24 +592,24 @@
     return ""+d.getFullYear()+z(d.getMonth()+1)+z(d.getDate())+"-"+z(d.getHours())+z(d.getMinutes());
   }
 
-  function offer(blob){
-    var base="qiraa-"+stamp();
-    getDl().then(function(d){
-      if(!d) return anchor(blob, base);
-      return d.save({ filename: base+"."+rec.ext, data: blob })
-        .then(function(){ say("تم حفظ الملف الصوتي."); })
-        .catch(function(){ anchor(blob, base); });
-    });
-  }
-
-  function anchor(blob, base){
-    var ext = rec.ext==="mp4" ? "m4a" : rec.ext;
-    var u=URL.createObjectURL(blob);
+  /* Offer the file three ways, because a page inside a viewer frame is not
+     always allowed to start a download on its own. */
+  function deliver(blob, ext){
+    var name="qiraa-"+stamp()+"."+ext;
+    var url=URL.createObjectURL(blob);
+    var mb=(blob.size/1048576).toFixed(1);
+    note.innerHTML="";
+    var p=document.createElement("p");
+    p.style.margin="0 0 .5rem";
+    p.textContent="الملف جاهز — "+ext.toUpperCase()+"، "+mb+" ميغابايت. إن لم يبدأ التنزيل تلقائيًا فاضغط الرابط في الأسفل.";
+    var au=document.createElement("audio");
+    au.controls=true; au.src=url; au.style.width="100%"; au.style.margin=".4rem 0";
     var a=document.createElement("a");
-    a.href=u; a.download=base+"."+ext;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(function(){ URL.revokeObjectURL(u); }, 30000);
-    say("تم إنشاء الملف الصوتي وتنزيله. أرسله كما هو عبر واتساب.");
+    a.href=url; a.download=name; a.textContent="تنزيل "+name;
+    a.style.color="var(--rubric)"; a.style.fontWeight="600";
+    note.appendChild(p); note.appendChild(au); note.appendChild(a);
+    note.hidden=false;
+    try{ a.click(); }catch(e){}
   }
 
   setInterval(function(){
